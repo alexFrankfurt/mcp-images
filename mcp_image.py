@@ -6,6 +6,7 @@ import asyncio
 import httpx
 import logging
 from io import BytesIO
+import base64
 from datetime import datetime
 from PIL import Image as PILImage
 from urllib.parse import urlparse
@@ -47,7 +48,7 @@ logger.propagate = False
 # Create a FastMCP server instance
 mcp = FastMCP("image-service")
 
-async def process_image_data(data: bytes, content_type: str, image_source: str, ctx: Context) -> Image | None:
+async def process_image_data(data: bytes, content_type: str, image_source: str, ctx: Context):
     """Process image data and return an MCP Image object."""
     try:
         # If image is not large, try to log dimensions without processing
@@ -59,19 +60,19 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
                     logger.debug(f"Image format from PIL: {img.format}, mode: {img.mode}")
             except Exception as e:
                 logger.debug(f"Could not determine dimensions for {image_source}: {e}")
-            
+
             # Ensure content_type is valid and doesn't include 'image/'
             if content_type.startswith('image/'):
                 content_type = content_type.split('/')[-1]
-            
-            logger.debug(f"Creating Image object with format: {content_type}")
+
+            logger.debug(f"Creating Image with format: {content_type}")
             return Image(data=data, format=content_type)
 
         # For large images, save to temp file and process
         temp_path = os.path.join(TEMP_DIR, f"temp_image_{hash(image_source)}." + content_type.split('/')[-1])
         with open(temp_path, "wb") as f:
             f.write(data)
-        
+
         try:
             # First pass: get dimensions and basic info
             with PILImage.open(temp_path) as img:
@@ -80,19 +81,19 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
                 orig_mode = img.mode
                 logger.debug(f"Original image dimensions from {image_source}: {orig_width}x{orig_height}")
                 logger.debug(f"Large image format from PIL: {orig_format}, mode: {orig_mode}")
-            
+
             # Calculate optimal resize factor if image is very large
             max_dimension = max(orig_width, orig_height)
             initial_scale = 1.0
             if max_dimension > 3000:
                 initial_scale = 3000 / max_dimension
                 logger.debug(f"Very large image detected ({max_dimension}px), will start with scale factor: {initial_scale}")
-            
+
             # Second pass: process the image
             with PILImage.open(temp_path) as img:
                 if img.mode in ('RGBA', 'P'):
                     img = img.convert('RGB')
-                
+
                 # Apply initial scale if needed
                 if initial_scale < 1.0:
                     width = int(orig_width * initial_scale)
@@ -100,13 +101,13 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
                     img = img.resize((width, height), PILImage.LANCZOS)
                 else:
                     width, height = img.size
-                
+
                 quality = 85
                 scale_factor = 1.0
-                
+
                 while True:
                     img_byte_arr = BytesIO()
-                    
+
                     # Create a copy for this iteration to avoid accumulating transforms
                     if scale_factor < 1.0:
                         current_width = int(width * scale_factor)
@@ -115,20 +116,20 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
                     else:
                         current_img = img
                         current_width, current_height = width, height
-                    
+
                     current_img.save(img_byte_arr, format='JPEG', quality=quality, optimize=True)
                     processed_data = img_byte_arr.getvalue()
-                    
+
                     # Clean up the temporary image if we created one
                     if scale_factor < 1.0 and hasattr(current_img, 'close'):
                         current_img.close()
-                    
+
                     # Target 800KB to leave buffer for any MCP overhead
                     if len(processed_data) <= 819200:  # 800KB
                         logger.debug(f"Processed image dimensions from {image_source}: {current_width}x{current_height} (quality={quality})")
                         logger.debug(f"Returning processed image with format: jpeg, size: {len(processed_data)} bytes")
-                        return Image(data=processed_data, format='jpeg')
-                    
+                        return Image(data=processed_data, format="jpeg")
+
                     # Try reducing quality first
                     if quality > 20:
                         quality -= 10
@@ -153,7 +154,7 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
-                
+
     except Exception as e:
         ctx.error(f"Error processing image: {str(e)}")
         logger.exception(f"Unexpected error processing {image_source}")
@@ -167,11 +168,11 @@ async def process_local_image(file_path: str, ctx: Context) -> Dict[str, Any]:
             ctx.error(error_msg)
             logger.error(error_msg)
             return {"path": file_path, "error": error_msg}
-        
+
         # Determine content type based on file extension
         _, ext = os.path.splitext(file_path)
         ext = ext[1:].lower() if ext else "jpeg"  # Default to jpeg if no extension
-        
+
         # Map extension to proper MIME type
         mime_type_map = {
             "jpg": "jpeg",
@@ -183,27 +184,27 @@ async def process_local_image(file_path: str, ctx: Context) -> Dict[str, Any]:
             "tiff": "tiff",
             "tif": "tiff"
         }
-        
+
         content_type = mime_type_map.get(ext, "jpeg")  # Default to jpeg if unknown extension
         logger.debug(f"Local image {file_path} has extension '{ext}', mapped to content type '{content_type}'")
-        
+
         # For large files, read and process directly without loading entire file into memory
         file_size = os.path.getsize(file_path)
         if file_size > 1048576:
             logger.debug(f"Large local image detected: {file_path} ({file_size} bytes)")
             # Process the image directly using the same logic as for URL images
             return await process_large_local_image(file_path, content_type, ctx)
-        
+
         # For smaller files, read the entire content
         with open(file_path, "rb") as f:
             file_data = f.read()
-        
+
         logger.debug(f"Read local image from {file_path} with {len(file_data)} bytes")
         processed_image = await process_image_data(file_data, content_type, file_path, ctx)
-        
+
         if processed_image is None:
             return {"path": file_path, "error": "Failed to process image"}
-        
+
         return {"path": file_path, "image": processed_image}
         
     except Exception as e:
@@ -216,9 +217,6 @@ async def process_large_local_image(file_path: str, content_type: str, ctx: Cont
     """Process a large local image file directly without loading it entirely into memory."""
     temp_path = None
     try:
-        # Create a temporary file path for processing
-        temp_path = os.path.join(TEMP_DIR, f"temp_local_{os.path.basename(file_path)}")
-        
         # First pass: get dimensions and basic info
         with PILImage.open(file_path) as img:
             orig_width, orig_height = img.size
@@ -226,19 +224,19 @@ async def process_large_local_image(file_path: str, content_type: str, ctx: Cont
             orig_mode = img.mode
             logger.debug(f"Original large local image dimensions from {file_path}: {orig_width}x{orig_height}")
             logger.debug(f"Original image format: {orig_format}, mode: {orig_mode}")
-        
+
         # Calculate optimal resize factor if image is very large
         max_dimension = max(orig_width, orig_height)
         initial_scale = 1.0
         if max_dimension > 4000:
             initial_scale = 4000 / max_dimension
             logger.debug(f"Very large image detected, will start with scale factor: {initial_scale}")
-        
+
         # Second pass: process the image
         with PILImage.open(file_path) as img:
             if img.mode in ('RGBA', 'P'):
                 img = img.convert('RGB')
-            
+
             # Apply initial scale if needed
             if initial_scale < 1.0:
                 width = int(orig_width * initial_scale)
@@ -246,14 +244,14 @@ async def process_large_local_image(file_path: str, content_type: str, ctx: Cont
                 img = img.resize((width, height), PILImage.LANCZOS)
             else:
                 width, height = img.size
-            
+
             quality = 75  # Start with lower quality for large images
             scale_factor = 1.0
-            
+
             while True:
                 # Save the processed image to a temporary BytesIO
                 img_byte_arr = BytesIO()
-                
+
                 # Create a copy for this iteration to avoid accumulating transforms
                 if scale_factor < 1.0:
                     current_width = int(width * scale_factor)
@@ -262,19 +260,22 @@ async def process_large_local_image(file_path: str, content_type: str, ctx: Cont
                 else:
                     current_img = img
                     current_width, current_height = width, height
-                
+
                 current_img.save(img_byte_arr, format='JPEG', quality=quality, optimize=True)
                 processed_data = img_byte_arr.getvalue()
-                
+
                 # Clean up the temporary image if we created one
                 if scale_factor < 1.0 and hasattr(current_img, 'close'):
                     current_img.close()
-                
+
                 # Target 800KB to leave buffer for any MCP overhead
                 if len(processed_data) <= 819200:  # 800KB
                     logger.debug(f"Successfully compressed large local image {file_path} to {len(processed_data)} bytes (quality={quality}, dimensions={current_width}x{current_height})")
-                    return {"path": file_path, "image": Image(data=processed_data, format='jpeg')}
-                
+                    return {
+                        "path": file_path,
+                        "image": Image(data=processed_data, format="jpeg")
+                    }
+
                 # Try reducing quality first
                 if quality > 30:
                     quality -= 10
@@ -287,10 +288,10 @@ async def process_large_local_image(file_path: str, content_type: str, ctx: Cont
                         ctx.error(error_msg)
                         logger.error(error_msg)
                         return {"path": file_path, "error": error_msg}
-                    
+
                     logger.debug(f"Applying scale factor {scale_factor} to image {file_path}")
                     quality = 85  # Reset quality when changing size
-    
+
     except MemoryError as e:
         error_msg = f"Out of memory processing large local image {file_path}: {str(e)}"
         ctx.error(error_msg)
@@ -301,11 +302,6 @@ async def process_large_local_image(file_path: str, content_type: str, ctx: Cont
         ctx.error(error_msg)
         logger.exception(error_msg)
         return {"path": file_path, "error": error_msg}
-    
-    finally:
-        # Clean up temporary file if it exists
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
 
 async def fetch_single_image(url: str, client: httpx.AsyncClient, ctx: Context) -> Dict[str, Any]:
     """Fetches and processes a single image asynchronously."""
@@ -318,7 +314,7 @@ async def fetch_single_image(url: str, client: httpx.AsyncClient, ctx: Context) 
 
         response = await client.get(url)
         response.raise_for_status()
-        
+
         content_type = response.headers.get('content-type', '')
         if not content_type.startswith('image/'):
             error_msg = f"Not an image (got {content_type})"
@@ -327,16 +323,16 @@ async def fetch_single_image(url: str, client: httpx.AsyncClient, ctx: Context) 
 
         logger.debug(f"Fetched image from {url} with {len(response.content)} bytes")
         logger.debug(f"Content-Type from server: {content_type}")
-        
+
         # Extract the format from content-type
         format_type = content_type.split('/')[-1]
         logger.debug(f"Extracted format type: {format_type}")
-        
+
         processed_image = await process_image_data(response.content, format_type, url, ctx)
-        
+
         if processed_image is None:
             return {"url": url, "error": "Failed to process image"}
-        
+
         return {"url": url, "image": processed_image}
 
     except httpx.HTTPError as e:
@@ -390,62 +386,194 @@ async def process_images_async(image_sources: List[str], ctx: Context) -> List[D
     return ordered_results
 
 @mcp.tool()
-async def fetch_images(image_sources: List[str], ctx: Context) -> List[Image | None]:
+async def fetch_images(image_sources: List[str], ctx: Context = None):
     """
     Fetch and process images from URLs or local file paths, returning them in a format suitable for LLMs.
-    
+
     This tool accepts a list of image sources which can be either:
     1. URLs pointing to web-hosted images (http:// or https://)
     2. Local file paths pointing to images stored on the local filesystem (e.g., "C:/images/photo1.jpg")
-    
+
     For a single image, provide a one-element list. The function will process images in parallel
-    when multiple sources are provided. Images that exceed the size limit (1MB) will be automatically 
+    when multiple sources are provided. Images that exceed the size limit (1MB) will be automatically
     compressed while maintaining aspect ratio and reasonable quality.
-    
+
     Args:
         image_sources: A list of image URLs or local file paths. For a single image, provide a one-element list.
-        
+
     Returns:
-        A list of Image objects or None values (if processing failed) in the same order as the input sources.
+        A list containing text information about the processed images followed by Image objects.
+        Each image source is represented with a text description, followed by the actual Image object.
+        Failed images will have an error message instead of an Image object.
     """
     try:
         start_time = asyncio.get_event_loop().time()
-        
+
         # Validate input
         if not image_sources:
-            ctx.error("No image sources provided")
+            if ctx is not None:
+                ctx.error("No image sources provided")
             logger.error("fetch_images called with empty source list")
-            return []
-        
+            return ["No image sources provided"]
+
         # Log the types of sources we're processing
         url_count = sum(1 for src in image_sources if is_url(src))
         local_count = len(image_sources) - url_count
         logger.debug(f"Processing {len(image_sources)} image sources: {url_count} URLs and {local_count} local files")
-        
+
         # Process all images
         results = await process_images_async(image_sources, ctx)
+
+        # Build response list with text + images (same pattern as snapshot tool)
+        response_parts = []
+        success_count = 0
         
-        # Extract just the Image objects or None values
-        image_results = []
-        for result in results:
+        for src, result in zip(image_sources, results):
             if "image" in result:
-                image_results.append(result["image"])
+                img_field = result["image"]
+                # Handle both single Image and list of Images
+                if isinstance(img_field, list):
+                    response_parts.append(f"Successfully processed {len(img_field)} image(s) from: {src}")
+                    for img in img_field:
+                        response_parts.append(img)
+                else:
+                    response_parts.append(f"Successfully processed image from: {src}")
+                    response_parts.append(img_field)
+                success_count += 1
             else:
-                image_results.append(None)
-        
+                error_msg = result.get("error", "Unknown error")
+                response_parts.append(f"Failed to process {src}: {error_msg}")
+
         elapsed = asyncio.get_event_loop().time() - start_time
-        success_count = sum(1 for r in image_results if r is not None)
-        
         logger.debug(
             f"Processed {len(image_sources)} images in {elapsed:.2f} seconds. "
             f"Success: {success_count}, Failed: {len(image_sources) - success_count}"
         )
-        
-        return image_results
+
+        return response_parts
     except Exception as e:
         logger.exception("Error in fetch_images")
-        ctx.error(f"Failed to process images: {str(e)}")
-        return [None] * len(image_sources)
+        if ctx is not None:
+            ctx.error(f"Failed to process images: {str(e)}")
+        return [f"Error processing images: {str(e)}"]
+
+
+
+
+# Cross-platform screen capture functionality
+def get_platform_screenshot():
+    """Capture screenshot using platform-appropriate method."""
+    try:
+        # Try to use PIL/Pillow's ImageGrab first (works on Windows, macOS, some Linux)
+        from PIL import ImageGrab
+        return ImageGrab.grab()
+    except ImportError:
+        # If PIL ImageGrab is not available, try mss (works cross-platform)
+        try:
+            import mss
+            with mss.mss() as sct:
+                # Get the primary monitor
+                monitor = sct.monitors[1]  # monitors[0] is all monitors combined, monitors[1+] are individual
+                screenshot = sct.grab(monitor)
+                # Convert mss image to PIL Image
+                return PILImage.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+        except ImportError:
+            # If neither PIL ImageGrab nor mss are available, try pyautogui
+            try:
+                import pyautogui
+                return pyautogui.screenshot()
+            except ImportError:
+                raise RuntimeError("No screen capture library available. Install pillow, mss, or pyautogui.")
+
+@mcp.tool()
+async def snapshot(use_vision: bool = False, image_file: str = None, ctx: Context = None):
+    """
+    Captures the current screen or loads an image file and optionally returns it for LLM analysis.
+    
+    This tool mimics the Windows-MCP Snapshot functionality but works cross-platform.
+    It captures the current screen state and can optionally return a screenshot image
+    that can be analyzed by LLMs when use_vision is True. Alternatively, you can provide
+    an image file path to load and analyze.
+    
+    Args:
+        use_vision: If True, includes an image in the response for visual analysis
+        image_file: Optional file path to load an image from instead of capturing screen
+        
+    Returns:
+        A list containing system information text and optionally an Image object
+    """
+    try:
+        # Gather system information (similar to Windows-MCP but cross-platform)
+        import platform
+        import psutil
+        from datetime import datetime
+      
+        # Create the main response with system information
+        response_parts = []
+        
+        # If vision is requested, capture and process the screenshot or load from file
+        if use_vision:
+            try:
+                if image_file:
+                    # Load image from file
+                    if not os.path.exists(image_file):
+                        error_msg = f"Image file does not exist: {image_file}"
+                        if ctx is not None:
+                            ctx.error(error_msg)
+                        logger.error(error_msg)
+                        response_parts.append(f"\nNote: Could not load image - {error_msg}")
+                    else:
+                        screenshot = PILImage.open(image_file)
+                        logger.debug(f"Loaded image from file: {image_file}")
+                else:
+                    # Capture the screenshot
+                    screenshot = get_platform_screenshot()
+                    logger.debug(f"Captured screenshot from screen")
+                
+                # Resize the image to prevent oversized images (following Windows-MCP approach)
+                MAX_SCREENSHOT_WIDTH, MAX_SCREENSHOT_HEIGHT = 1920, 1080
+                screenshot_width, screenshot_height = screenshot.size
+                
+                # Calculate scale factor to cap resolution at 1080p
+                scale_width = MAX_SCREENSHOT_WIDTH / screenshot_width if screenshot_width > MAX_SCREENSHOT_WIDTH else 1.0
+                scale_height = MAX_SCREENSHOT_HEIGHT / screenshot_height if screenshot_height > MAX_SCREENSHOT_HEIGHT else 1.0
+                scale = min(scale_width, scale_height)  # Use the smaller scale to ensure both dimensions fit
+                
+                new_width, new_height = screenshot_width, screenshot_height  # Initialize variables
+                
+                if scale < 1.0:
+                    new_width = int(screenshot_width * scale)
+                    new_height = int(screenshot_height * scale)
+                    screenshot = screenshot.resize((new_width, new_height), PILImage.LANCZOS)
+                
+                # Process the screenshot using existing image processing pipeline
+                img_byte_arr = BytesIO()
+                screenshot.save(img_byte_arr, format='PNG')  # Using PNG to preserve quality
+                img_data = img_byte_arr.getvalue()
+                
+                # Create an Image object to return to the LLM
+                image_obj = Image(data=img_data, format='png')
+                response_parts.append(image_obj)
+                
+                logger.debug(f"Image processed: {screenshot_width}x{screenshot_height} -> {new_width}x{new_height}")
+                
+            except Exception as e:
+                error_msg = f"Error processing image: {str(e)}"
+                if ctx is not None:
+                    ctx.error(error_msg)
+                logger.error(error_msg)
+                response_parts.append(f"\nNote: Could not process image - {str(e)}")
+        
+        return response_parts
+        
+    except Exception as e:
+        error_msg = f"Error in snapshot tool: {str(e)}"
+        ctx.error(error_msg)
+        logger.exception(error_msg)
+        return [f"Error capturing system state: {str(e)}"]
+
+def main():
+    mcp.run(transport='stdio')
 
 if __name__ == "__main__":
     mcp.run(transport='stdio')
