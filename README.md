@@ -1,6 +1,6 @@
 # MCP Images
 
-A cross-platform image processing and screen capture MCP server that enables AI agents to interact with images and capture screenshots.
+A cross-platform image processing and screen capture MCP server that enables AI agents to interact with images and capture screenshots. Derived from https://github.com/IA-Programming/mcp-images
 
 ## Features
 
