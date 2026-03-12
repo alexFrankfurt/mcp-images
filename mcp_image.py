@@ -507,7 +507,7 @@ async def snapshot(use_vision: bool = False, image_file: str = None, ctx: Contex
         import platform
         import psutil
         from datetime import datetime
-      
+       
         # Create the main response with system information
         response_parts = []
         
@@ -571,6 +571,119 @@ async def snapshot(use_vision: bool = False, image_file: str = None, ctx: Contex
         ctx.error(error_msg)
         logger.exception(error_msg)
         return [f"Error capturing system state: {str(e)}"]
+
+
+@mcp.tool()
+async def mouse_rect(width: int = 100, height: int = 100, ctx: Context = None):
+    """
+    Captures a small rectangle around the current mouse position and returns it as an image.
+    
+    This tool captures a screenshot of a rectangular area centered on the current mouse cursor
+    position, with the specified width and height. It's useful for getting a close-up view
+    of what's currently under the mouse pointer.
+    
+    Args:
+        width: Width of the rectangle to capture (default: 100 pixels)
+        height: Height of the rectangle to capture (default: 100 pixels)
+        ctx: MCP context for logging and error reporting
+        
+    Returns:
+        A list containing a text description and the captured Image object
+    """
+    try:
+        # Get mouse position using cross-platform approach
+        try:
+            import pyautogui
+            x, y = pyautogui.position()
+        except ImportError:
+            # Fallback: try to get position using platform-specific methods
+            import platform
+            system = platform.system()
+            if system == "Windows":
+                try:
+                    import win32gui
+                    point = win32gui.GetCursorPos()
+                    x, y = point
+                except ImportError:
+                    # Last resort: use ctypes
+                    import ctypes
+                    class POINT(ctypes.Structure):
+                        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+                    pt = POINT()
+                    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+                    x, y = pt.x, pt.y
+            elif system == "Darwin":  # macOS
+                try:
+                    from Quartz import CGEventCreate, CGEventGetLocation
+                    event = CGEventCreate(None)
+                    point = CGEventGetLocation(event)
+                    x, y = point.x, point.y
+                except ImportError:
+                    raise RuntimeError("Unable to get mouse position on macOS without Quartz")
+            else:  # Linux and others
+                try:
+                    import Xlib.display
+                    display = Xlib.display.Display()
+                    root = display.screen().root
+                    data = root.query_pointer()._data
+                    x, y = data["root_x"], data["root_y"]
+                except ImportError:
+                    raise RuntimeError("Unable to get mouse position on Linux without Xlib")
+        
+        # Calculate the rectangle boundaries
+        left = max(0, x - width // 2)
+        top = max(0, y - height // 2)
+        right = left + width
+        bottom = top + height
+        
+        # Capture the screen
+        screenshot = get_platform_screenshot()
+        
+        # Crop to the desired rectangle
+        # Ensure we don't go beyond screen boundaries
+        screen_width, screen_height = screenshot.size
+        left = min(left, screen_width)
+        top = min(top, screen_height)
+        right = min(right, screen_width)
+        bottom = min(bottom, screen_height)
+        
+        # Only crop if we have a valid rectangle
+        if right > left and bottom > top:
+            screenshot = screenshot.crop((left, top, right, bottom))
+        else:
+            # If the rectangle is invalid, capture a small area around the mouse
+            # but adjust to stay within bounds
+            size = min(50, screen_width // 4, screen_height // 4)  # Default to 50px or 1/4 screen
+            left = max(0, min(x - size // 2, screen_width - size))
+            top = max(0, min(y - size // 2, screen_height - size))
+            right = left + size
+            bottom = top + size
+            screenshot = screenshot.crop((left, top, right, bottom))
+        
+        logger.debug(f"Captured mouse rectangle: {left},{top} to {right},{bottom} (size: {screenshot.size})")
+        
+        # Process the screenshot using existing image processing pipeline
+        img_byte_arr = BytesIO()
+        screenshot.save(img_byte_arr, format='PNG')  # Using PNG to preserve quality
+        img_data = img_byte_arr.getvalue()
+        
+        # Create an Image object to return to the LLM
+        image_obj = Image(data=img_data, format='png')
+        
+        # Return response with description and image
+        response_parts = [
+            f"Captured {screenshot.size[0]}x{screenshot.size[1]} pixel rectangle around mouse position ({x}, {y})",
+            image_obj
+        ]
+        
+        return response_parts
+        
+    except Exception as e:
+        error_msg = f"Error capturing mouse rectangle: {str(e)}"
+        if ctx is not None:
+            ctx.error(error_msg)
+        logger.exception(error_msg)
+        return [f"Error capturing mouse rectangle: {str(e)}"]
 
 def main():
     mcp.run(transport='stdio')
