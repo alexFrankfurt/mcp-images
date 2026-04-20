@@ -685,6 +685,253 @@ async def mouse_rect(width: int = 100, height: int = 100, ctx: Context = None):
         logger.exception(error_msg)
         return [f"Error capturing mouse rectangle: {str(e)}"]
 
+
+@mcp.tool()
+async def mouse_click(x: int, y: int, button: str = "left", ctx: Context = None):
+    """
+    Move the mouse to a specified position and click.
+
+    This tool moves the mouse cursor to the given coordinates and performs a click
+    using the specified mouse button.
+
+    Args:
+        x: X coordinate to click
+        y: Y coordinate to click
+        button: Mouse button to click, one of left, right, or middle
+        ctx: MCP context for logging and error reporting
+
+    Returns:
+        A list containing a text description of the click action
+    """
+    try:
+        normalized_button = button.lower()
+        if normalized_button not in {"left", "right", "middle"}:
+            raise ValueError(f"Invalid button '{button}'. Expected left, right, or middle.")
+
+        try:
+            import pyautogui
+
+            pyautogui.moveTo(x, y)
+            pyautogui.click(button=normalized_button)
+        except ImportError:
+            import platform
+
+            system = platform.system()
+            if system == "Windows":
+                import ctypes
+
+                ctypes.windll.user32.SetCursorPos(x, y)
+                button_flags = {
+                    "left": (0x0002, 0x0004),
+                    "right": (0x0008, 0x0010),
+                    "middle": (0x0020, 0x0040),
+                }
+                down_flag, up_flag = button_flags[normalized_button]
+                ctypes.windll.user32.mouse_event(down_flag, 0, 0, 0, 0)
+                ctypes.windll.user32.mouse_event(up_flag, 0, 0, 0, 0)
+            elif system == "Darwin":
+                raise RuntimeError("Mouse clicking without pyautogui is not implemented on macOS.")
+            else:
+                raise RuntimeError("Mouse clicking without pyautogui is not implemented on this platform.")
+
+        logger.debug(f"Clicked {normalized_button} mouse button at position ({x}, {y})")
+        return [f"Clicked the {normalized_button} mouse button at ({x}, {y})"]
+
+    except Exception as e:
+        error_msg = f"Error clicking mouse: {str(e)}"
+        if ctx is not None:
+            ctx.error(error_msg)
+        logger.exception(error_msg)
+        return [f"Error clicking mouse: {str(e)}"]
+
+
+@mcp.tool()
+async def mouse_move_screenshot(x: int, y: int, width: int = 200, height: int = 200, ctx: Context = None):
+    """
+    Move the mouse to a specified position and return a screenshot at the target position with a visual indicator.
+    
+    This tool moves the mouse cursor to the specified coordinates, captures a screenshot
+    around that position, and adds a visual indicator (red crosshair) to show the exact
+    mouse position since cursor capture is not always possible with screenshot methods.
+    
+    Args:
+        x: X coordinate to move mouse to
+        y: Y coordinate to move mouse to
+        width: Width of the rectangle to capture around the position (default: 200 pixels)
+        height: Height of the rectangle to capture around the position (default: 200 pixels)
+        ctx: MCP context for logging and error reporting
+        
+    Returns:
+        A list containing a text description and the captured Image object with visual indicator
+    """
+    try:
+        # Move mouse to specified position
+        try:
+            import pyautogui
+            pyautogui.moveTo(x, y)
+            logger.debug(f"Moved mouse to position ({x}, {y})")
+        except ImportError:
+            # Fallback: try to move position using platform-specific methods
+            import platform
+            system = platform.system()
+            if system == "Windows":
+                try:
+                    import ctypes
+                    ctypes.windll.user32.SetCursorPos(x, y)
+                except Exception as e:
+                    raise RuntimeError(f"Unable to move mouse on Windows: {str(e)}")
+            elif system == "Darwin":  # macOS
+                try:
+                    from Quartz import CGEventCreateMouseEvent, CGEventPost, kCGHIDEventTap
+                    event = CGEventCreateMouseEvent(None, kCGEventMouseMoved, (x, y), 0)
+                    CGEventPost(kCGHIDEventTap, event)
+                except ImportError:
+                    raise RuntimeError("Unable to move mouse on macOS without Quartz")
+            else:  # Linux and others
+                try:
+                    import Xlib.display
+                    import Xlib.X
+                    display = Xlib.display.Display()
+                    root = display.screen().root
+                    # Warp the pointer
+                    root.warp_pointer(x, y)
+                    display.sync()
+                except ImportError:
+                    raise RuntimeError("Unable to move mouse on Linux without Xlib")
+        
+        # Small delay to ensure mouse movement completes
+        import asyncio
+        await asyncio.sleep(0.1)
+        
+        # Get mouse position after movement to confirm
+        try:
+            import pyautogui
+            actual_x, actual_y = pyautogui.position()
+        except ImportError:
+            # Fallback: try to get position using platform-specific methods
+            import platform
+            system = platform.system()
+            if system == "Windows":
+                try:
+                    import win32gui
+                    point = win32gui.GetCursorPos()
+                    actual_x, actual_y = point
+                except ImportError:
+                    # Last resort: use ctypes
+                    import ctypes
+                    class POINT(ctypes.Structure):
+                        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+                    pt = POINT()
+                    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+                    actual_x, actual_y = pt.x, pt.y
+            elif system == "Darwin":  # macOS
+                try:
+                    from Quartz import CGEventCreate, CGEventGetLocation
+                    event = CGEventCreate(None)
+                    point = CGEventGetLocation(event)
+                    actual_x, actual_y = point.x, point.y
+                except ImportError:
+                    raise RuntimeError("Unable to get mouse position on macOS without Quartz")
+            else:  # Linux and others
+                try:
+                    import Xlib.display
+                    display = Xlib.display.Display()
+                    root = display.screen().root
+                    data = root.query_pointer()._data
+                    actual_x, actual_y = data["root_x"], data["root_y"]
+                except ImportError:
+                    raise RuntimeError("Unable to get mouse position on Linux without Xlib")
+        
+        logger.debug(f"Mouse moved to confirmed position ({actual_x}, {actual_y})")
+        
+        # Calculate the rectangle boundaries for screenshot
+        left = max(0, actual_x - width // 2)
+        top = max(0, actual_y - height // 2)
+        right = left + width
+        bottom = top + height
+        
+        # Capture the screen
+        screenshot = get_platform_screenshot()
+        
+        # Crop to the desired rectangle
+        # Ensure we don't go beyond screen boundaries
+        screen_width, screen_height = screenshot.size
+        left = min(left, screen_width)
+        top = min(top, screen_height)
+        right = min(right, screen_width)
+        bottom = min(bottom, screen_height)
+        
+        # Only crop if we have a valid rectangle
+        if right > left and bottom > top:
+            screenshot = screenshot.crop((left, top, right, bottom))
+        else:
+            # If the rectangle is invalid, capture a small area around the mouse
+            # but adjust to stay within bounds
+            size = min(50, screen_width // 4, screen_height // 4)  # Default to 50px or 1/4 screen
+            left = max(0, min(actual_x - size // 2, screen_width - size))
+            top = max(0, min(actual_y - size // 2, screen_height - size))
+            right = left + size
+            bottom = top + size
+            screenshot = screenshot.crop((left, top, right, bottom))
+        
+        # Add visual indicator (red crosshair) at the mouse position
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(screenshot)
+        
+        # Calculate position of mouse within the cropped screenshot
+        mouse_x_in_screenshot = actual_x - left
+        mouse_y_in_screenshot = actual_y - top
+        
+        # Draw crosshair
+        crosshair_size = 10
+        crosshair_width = 2
+        red_color = (255, 0, 0)  # Red
+        
+        # Horizontal line
+        draw.line([
+            (mouse_x_in_screenshot - crosshair_size, mouse_y_in_screenshot),
+            (mouse_x_in_screenshot + crosshair_size, mouse_y_in_screenshot)
+        ], fill=red_color, width=crosshair_width)
+        
+        # Vertical line
+        draw.line([
+            (mouse_x_in_screenshot, mouse_y_in_screenshot - crosshair_size),
+            (mouse_x_in_screenshot, mouse_y_in_screenshot + crosshair_size)
+        ], fill=red_color, width=crosshair_width)
+        
+        # Optional: draw a circle around the center
+        circle_radius = 15
+        draw.ellipse([
+            (mouse_x_in_screenshot - circle_radius, mouse_y_in_screenshot - circle_radius),
+            (mouse_x_in_screenshot + circle_radius, mouse_y_in_screenshot + circle_radius)
+        ], outline=red_color, width=crosshair_width)
+        
+        logger.debug(f"Captured mouse move screenshot: {left},{top} to {right},{bottom} (size: {screenshot.size})")
+        
+        # Process the screenshot using existing image processing pipeline
+        img_byte_arr = BytesIO()
+        screenshot.save(img_byte_arr, format='PNG')  # Using PNG to preserve quality
+        img_data = img_byte_arr.getvalue()
+        
+        # Create an Image object to return to the LLM
+        image_obj = Image(data=img_data, format='png')
+        
+        # Return response with description and image
+        response_parts = [
+            f"Moved mouse to ({actual_x}, {actual_y}) and captured {screenshot.size[0]}x{screenshot.size[1]} pixel rectangle with visual indicator",
+            image_obj
+        ]
+        
+        return response_parts
+        
+    except Exception as e:
+        error_msg = f"Error in mouse move screenshot: {str(e)}"
+        if ctx is not None:
+            ctx.error(error_msg)
+        logger.exception(error_msg)
+        return [f"Error in mouse move screenshot: {str(e)}"]
+
+
 def main():
     mcp.run(transport='stdio')
 
