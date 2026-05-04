@@ -349,6 +349,47 @@ def is_url(path_or_url: str) -> bool:
     parsed = urlparse(path_or_url)
     return bool(parsed.scheme and parsed.netloc)
 
+
+async def format_image_output(image_data: bytes, image_format: str, output_mode: str, output_path: str,
+                              ctx: Context, description: str = "") -> Dict[str, Any]:
+    """Format image output based on output mode - stream or file."""
+    if output_mode == "file":
+        if not output_path:
+            error_msg = "output_path is required when output_mode is 'file'"
+            if ctx is not None:
+                ctx.error(error_msg)
+            logger.error(error_msg)
+            return {"error": error_msg}
+
+        try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+            with open(output_path, "wb") as f:
+                f.write(image_data)
+
+            logger.debug(f"Saved image to {output_path}")
+            return {
+                "text": f"{description} Saved to: {output_path}",
+                "file_path": output_path
+            }
+        except Exception as e:
+            error_msg = f"Failed to save image to {output_path}: {str(e)}"
+            if ctx is not None:
+                ctx.error(error_msg)
+            logger.error(error_msg)
+            return {"error": error_msg}
+
+    # Default: stream mode
+    return {"image": Image(data=image_data, format=image_format)}
+
+
+def is_image_file_path(path: str) -> bool:
+    """Check if path looks like a file path with an image extension."""
+    ext = os.path.splitext(path)[1].lower()
+    return ext in ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff', '.tif')
+
+
 async def process_images_async(image_sources: List[str], ctx: Context) -> List[Dict[str, Any]]:
     """Process multiple images (URLs or local files) concurrently."""
     if not image_sources:
@@ -386,7 +427,7 @@ async def process_images_async(image_sources: List[str], ctx: Context) -> List[D
     return ordered_results
 
 @mcp.tool()
-async def fetch_images(image_sources: List[str], ctx: Context = None):
+async def fetch_images(image_sources: List[str], output_mode: str = "stream", output_path: str = None, ctx: Context = None):
     """
     Fetch and process images from URLs or local file paths, returning them in a format suitable for LLMs.
 
@@ -400,10 +441,13 @@ async def fetch_images(image_sources: List[str], ctx: Context = None):
 
     Args:
         image_sources: A list of image URLs or local file paths. For a single image, provide a one-element list.
+        output_mode: Output destination - "stream" returns image in response (default), "file" writes to output_path
+        output_path: File path or directory path for file output mode. For multiple images, this should be a directory.
+                     For a single image, can be a specific file path (e.g., "C:/images/photo.png").
 
     Returns:
-        A list containing text information about the processed images followed by Image objects.
-        Each image source is represented with a text description, followed by the actual Image object.
+        A list containing text information about the processed images followed by Image objects (stream mode),
+        or file paths where images were saved (file mode).
         Failed images will have an error message instead of an Image object.
     """
     try:
@@ -427,19 +471,64 @@ async def fetch_images(image_sources: List[str], ctx: Context = None):
         # Build response list with text + images (same pattern as snapshot tool)
         response_parts = []
         success_count = 0
-        
-        for src, result in zip(image_sources, results):
+
+        for i, (src, result) in enumerate(zip(image_sources, results)):
             if "image" in result:
                 img_field = result["image"]
                 # Handle both single Image and list of Images
                 if isinstance(img_field, list):
-                    response_parts.append(f"Successfully processed {len(img_field)} image(s) from: {src}")
-                    for img in img_field:
-                        response_parts.append(img)
+                    if output_mode == "file":
+                        saved_files = []
+                        for j, img in enumerate(img_field):
+                            ext = img.format if hasattr(img, 'format') else 'png'
+                            # For single image source with a file-like output_path, use it directly
+                            if len(image_sources) == 1 and output_path and is_image_file_path(output_path):
+                                file_path = output_path
+                            else:
+                                file_path = os.path.join(output_path, f"image_{i+1}_{j+1}.{ext}") if output_path else None
+
+                            output_result = await format_image_output(
+                                img.data, ext, output_mode, file_path, ctx,
+                                f"Successfully processed image {j+1} from: {src}"
+                            )
+                            if "file_path" in output_result:
+                                saved_files.append(output_result["file_path"])
+                            elif "error" in output_result:
+                                response_parts.append(f"Failed to save image {j+1} from {src}: {output_result['error']}")
+
+                        if saved_files:
+                            response_parts.append(f"Successfully processed {len(img_field)} image(s) from: {src}")
+                            response_parts.extend(saved_files)
+                            success_count += 1
+                    else:
+                        response_parts.append(f"Successfully processed {len(img_field)} image(s) from: {src}")
+                        for img in img_field:
+                            response_parts.append(img)
+                        success_count += 1
                 else:
-                    response_parts.append(f"Successfully processed image from: {src}")
-                    response_parts.append(img_field)
-                success_count += 1
+                    ext = img_field.format if hasattr(img_field, 'format') else 'png'
+                    # For single image source with a file-like output_path, use it directly
+                    if output_mode == "file" and len(image_sources) == 1 and output_path and is_image_file_path(output_path):
+                        file_path = output_path
+                    elif output_mode == "file" and output_path:
+                        file_path = os.path.join(output_path, f"image_{i+1}.{ext}")
+                    else:
+                        file_path = output_path
+
+                    output_result = await format_image_output(
+                        img_field.data, ext, output_mode, file_path, ctx,
+                        f"Successfully processed image from: {src}"
+                    )
+
+                    if "image" in output_result:
+                        response_parts.append(f"Successfully processed image from: {src}")
+                        response_parts.append(output_result["image"])
+                        success_count += 1
+                    elif "text" in output_result:
+                        response_parts.append(output_result["text"])
+                        success_count += 1
+                    elif "error" in output_result:
+                        response_parts.append(f"Failed to process {src}: {output_result['error']}")
             else:
                 error_msg = result.get("error", "Unknown error")
                 response_parts.append(f"Failed to process {src}: {error_msg}")
@@ -485,29 +574,154 @@ def get_platform_screenshot():
             except ImportError:
                 raise RuntimeError("No screen capture library available. Install pillow, mss, or pyautogui.")
 
+
+def get_window_list():
+    """Get a list of visible windows with their titles and positions.
+    
+    Returns a list of dictionaries with keys: title, left, top, right, bottom, width, height.
+    Currently supports Windows via win32gui or ctypes.
+    """
+    import platform
+    system = platform.system()
+    windows = []
+    
+    if system == "Windows":
+        try:
+            import win32gui
+            
+            def enum_callback(hwnd, results):
+                if win32gui.IsWindowVisible(hwnd):
+                    title = win32gui.GetWindowText(hwnd)
+                    if title:
+                        rect = win32gui.GetWindowRect(hwnd)
+                        left, top, right, bottom = rect
+                        windows.append({
+                            "title": title,
+                            "left": left,
+                            "top": top,
+                            "right": right,
+                            "bottom": bottom,
+                            "width": right - left,
+                            "height": bottom - top
+                        })
+            
+            win32gui.EnumWindows(enum_callback, None)
+            return windows
+        except ImportError:
+            # Fallback to ctypes
+            import ctypes
+            from ctypes import wintypes
+            
+            EnumWindows = ctypes.windll.user32.EnumWindows
+            EnumWindowsProc = ctypes.WINFUNCTYPE(
+                ctypes.c_bool, wintypes.HWND, ctypes.POINTER(ctypes.c_int)
+            )
+            GetWindowText = ctypes.windll.user32.GetWindowTextW
+            GetWindowTextLength = ctypes.windll.user32.GetWindowTextLengthW
+            IsWindowVisible = ctypes.windll.user32.IsWindowVisible
+            GetWindowRect = ctypes.windll.user32.GetWindowRect
+            
+            def enum_callback(hwnd, _):
+                if IsWindowVisible(hwnd):
+                    length = GetWindowTextLength(hwnd)
+                    if length > 0:
+                        buffer = ctypes.create_unicode_buffer(length + 1)
+                        GetWindowText(hwnd, buffer, length + 1)
+                        title = buffer.value
+                        rect = ctypes.wintypes.RECT()
+                        GetWindowRect(hwnd, ctypes.byref(rect))
+                        windows.append({
+                            "title": title,
+                            "left": rect.left,
+                            "top": rect.top,
+                            "right": rect.right,
+                            "bottom": rect.bottom,
+                            "width": rect.right - rect.left,
+                            "height": rect.bottom - rect.top
+                        })
+                return True
+            
+            EnumWindows(EnumWindowsProc(enum_callback), 0)
+            return windows
+    else:
+        # macOS and Linux: not currently supported for window enumeration
+        return []
+
+
+def capture_window_by_title(window_title: str):
+    """Capture a screenshot of a specific window by its title.
+    
+    Args:
+        window_title: The title of the window to capture. Supports partial matching.
+        
+    Returns:
+        A PIL Image of the captured window region.
+        
+    Raises:
+        RuntimeError: If the platform is not supported or window is not found.
+    """
+    import platform
+    system = platform.system()
+    
+    if system != "Windows":
+        raise RuntimeError(f"Window-specific capture is not supported on {system}. Only Windows is currently supported.")
+    
+    windows = get_window_list()
+    if not windows:
+        raise RuntimeError("No visible windows found.")
+    
+    # Try exact match first
+    matched_window = None
+    for win in windows:
+        if win["title"] == window_title:
+            matched_window = win
+            break
+    
+    # Fall back to partial (case-insensitive) match
+    if matched_window is None:
+        search_lower = window_title.lower()
+        for win in windows:
+            if search_lower in win["title"].lower():
+                matched_window = win
+                break
+    
+    if matched_window is None:
+        available = [w["title"] for w in windows if w["title"]]
+        raise RuntimeError(f"Window with title '{window_title}' not found. Available windows: {available}")
+    
+    # Capture the window region
+    from PIL import ImageGrab
+    bbox = (
+        matched_window["left"],
+        matched_window["top"],
+        matched_window["right"],
+        matched_window["bottom"]
+    )
+    screenshot = ImageGrab.grab(bbox=bbox)
+    return screenshot, matched_window["title"]
+
 @mcp.tool()
-async def snapshot(use_vision: bool = False, image_file: str = None, ctx: Context = None):
+async def snapshot(use_vision: bool = False, image_file: str = None, output_mode: str = "stream", output_path: str = None, window_title: str = None, ctx: Context = None):
     """
     Captures the current screen or loads an image file and optionally returns it for LLM analysis.
-    
+
     This tool mimics the Windows-MCP Snapshot functionality but works cross-platform.
     It captures the current screen state and can optionally return a screenshot image
     that can be analyzed by LLMs when use_vision is True. Alternatively, you can provide
     an image file path to load and analyze.
-    
+
     Args:
         use_vision: If True, includes an image in the response for visual analysis
         image_file: Optional file path to load an image from instead of capturing screen
-        
+        output_mode: Output destination - "stream" returns image in response (default), "file" writes to output_path
+        output_path: File path to save the image when output_mode is "file"
+        window_title: Optional title of a specific window to capture instead of the full screen.
+                      Supports partial matching. Only supported on Windows.
+
     Returns:
-        A list containing system information text and optionally an Image object
+        A list containing system information text and optionally an Image object or file path
     """
     try:
-        # Gather system information (similar to Windows-MCP but cross-platform)
-        import platform
-        import psutil
-        from datetime import datetime
-       
         # Create the main response with system information
         response_parts = []
         
@@ -525,6 +739,10 @@ async def snapshot(use_vision: bool = False, image_file: str = None, ctx: Contex
                     else:
                         screenshot = PILImage.open(image_file)
                         logger.debug(f"Loaded image from file: {image_file}")
+                elif window_title:
+                    # Capture specific window
+                    screenshot, matched_title = capture_window_by_title(window_title)
+                    logger.debug(f"Captured window: {matched_title}")
                 else:
                     # Capture the screenshot
                     screenshot = get_platform_screenshot()
@@ -550,11 +768,21 @@ async def snapshot(use_vision: bool = False, image_file: str = None, ctx: Contex
                 img_byte_arr = BytesIO()
                 screenshot.save(img_byte_arr, format='PNG')  # Using PNG to preserve quality
                 img_data = img_byte_arr.getvalue()
-                
-                # Create an Image object to return to the LLM
-                image_obj = Image(data=img_data, format='png')
-                response_parts.append(image_obj)
-                
+
+                if output_mode == "file":
+                    output_result = await format_image_output(
+                        img_data, 'png', output_mode, output_path, ctx,
+                        "Screenshot saved."
+                    )
+                    if "text" in output_result:
+                        response_parts.append(output_result["text"])
+                    elif "error" in output_result:
+                        response_parts.append(f"\nNote: Could not save image - {output_result['error']}")
+                else:
+                    # Create an Image object to return to the LLM
+                    image_obj = Image(data=img_data, format='png')
+                    response_parts.append(image_obj)
+
                 logger.debug(f"Image processed: {screenshot_width}x{screenshot_height} -> {new_width}x{new_height}")
                 
             except Exception as e:
@@ -574,21 +802,65 @@ async def snapshot(use_vision: bool = False, image_file: str = None, ctx: Contex
 
 
 @mcp.tool()
-async def mouse_rect(width: int = 100, height: int = 100, ctx: Context = None):
+async def list_windows(ctx: Context = None):
+    """
+    List all visible open windows with their titles and positions.
+
+    This tool returns a list of visible windows on the system, including their
+    titles and bounding box coordinates. Use this to discover window titles
+    for the snapshot tool's window_title parameter.
+
+    Returns:
+        A list of text descriptions of visible windows.
+    """
+    try:
+        windows = get_window_list()
+        
+        if not windows:
+            import platform
+            system = platform.system()
+            if system != "Windows":
+                return [f"Window listing is only supported on Windows. Current platform: {system}"]
+            return ["No visible windows found."]
+        
+        response_parts = [f"Found {len(windows)} visible window(s):"]
+        
+        for i, win in enumerate(windows, 1):
+            response_parts.append(
+                f"{i}. Title: \"{win['title']}\" | "
+                f"Position: ({win['left']}, {win['top']}) | "
+                f"Size: {win['width']}x{win['height']}"
+            )
+        
+        logger.debug(f"Listed {len(windows)} windows")
+        return response_parts
+        
+    except Exception as e:
+        error_msg = f"Error listing windows: {str(e)}"
+        if ctx is not None:
+            ctx.error(error_msg)
+        logger.exception(error_msg)
+        return [f"Error listing windows: {str(e)}"]
+
+
+@mcp.tool()
+async def mouse_rect(width: int = 100, height: int = 100, output_mode: str = "stream", output_path: str = None, ctx: Context = None):
     """
     Captures a small rectangle around the current mouse position and returns it as an image.
-    
+
     This tool captures a screenshot of a rectangular area centered on the current mouse cursor
     position, with the specified width and height. It's useful for getting a close-up view
     of what's currently under the mouse pointer.
-    
+
     Args:
         width: Width of the rectangle to capture (default: 100 pixels)
         height: Height of the rectangle to capture (default: 100 pixels)
+        output_mode: Output destination - "stream" returns image in response (default), "file" writes to output_path
+        output_path: File path to save the image when output_mode is "file"
         ctx: MCP context for logging and error reporting
-        
+
     Returns:
-        A list containing a text description and the captured Image object
+        A list containing a text description and the captured Image object or file path
     """
     try:
         # Get mouse position using cross-platform approach
@@ -666,18 +938,27 @@ async def mouse_rect(width: int = 100, height: int = 100, ctx: Context = None):
         img_byte_arr = BytesIO()
         screenshot.save(img_byte_arr, format='PNG')  # Using PNG to preserve quality
         img_data = img_byte_arr.getvalue()
-        
+
+        description = f"Captured {screenshot.size[0]}x{screenshot.size[1]} pixel rectangle around mouse position ({x}, {y})"
+
+        if output_mode == "file":
+            output_result = await format_image_output(
+                img_data, 'png', output_mode, output_path, ctx, description
+            )
+            if "text" in output_result:
+                return [output_result["text"]]
+            elif "error" in output_result:
+                return [f"Error: {output_result['error']}"]
+
         # Create an Image object to return to the LLM
         image_obj = Image(data=img_data, format='png')
-        
+
         # Return response with description and image
-        response_parts = [
-            f"Captured {screenshot.size[0]}x{screenshot.size[1]} pixel rectangle around mouse position ({x}, {y})",
+        return [
+            description,
             image_obj
         ]
-        
-        return response_parts
-        
+
     except Exception as e:
         error_msg = f"Error capturing mouse rectangle: {str(e)}"
         if ctx is not None:
@@ -746,23 +1027,25 @@ async def mouse_click(x: int, y: int, button: str = "left", ctx: Context = None)
 
 
 @mcp.tool()
-async def mouse_move_screenshot(x: int, y: int, width: int = 200, height: int = 200, ctx: Context = None):
+async def mouse_move_screenshot(x: int, y: int, width: int = 200, height: int = 200, output_mode: str = "stream", output_path: str = None, ctx: Context = None):
     """
     Move the mouse to a specified position and return a screenshot at the target position with a visual indicator.
-    
+
     This tool moves the mouse cursor to the specified coordinates, captures a screenshot
     around that position, and adds a visual indicator (red crosshair) to show the exact
     mouse position since cursor capture is not always possible with screenshot methods.
-    
+
     Args:
         x: X coordinate to move mouse to
         y: Y coordinate to move mouse to
         width: Width of the rectangle to capture around the position (default: 200 pixels)
         height: Height of the rectangle to capture around the position (default: 200 pixels)
+        output_mode: Output destination - "stream" returns image in response (default), "file" writes to output_path
+        output_path: File path to save the image when output_mode is "file"
         ctx: MCP context for logging and error reporting
-        
+
     Returns:
-        A list containing a text description and the captured Image object with visual indicator
+        A list containing a text description and the captured Image object with visual indicator or file path
     """
     try:
         # Move mouse to specified position
@@ -912,18 +1195,27 @@ async def mouse_move_screenshot(x: int, y: int, width: int = 200, height: int = 
         img_byte_arr = BytesIO()
         screenshot.save(img_byte_arr, format='PNG')  # Using PNG to preserve quality
         img_data = img_byte_arr.getvalue()
-        
+
+        description = f"Moved mouse to ({actual_x}, {actual_y}) and captured {screenshot.size[0]}x{screenshot.size[1]} pixel rectangle with visual indicator"
+
+        if output_mode == "file":
+            output_result = await format_image_output(
+                img_data, 'png', output_mode, output_path, ctx, description
+            )
+            if "text" in output_result:
+                return [output_result["text"]]
+            elif "error" in output_result:
+                return [f"Error: {output_result['error']}"]
+
         # Create an Image object to return to the LLM
         image_obj = Image(data=img_data, format='png')
-        
+
         # Return response with description and image
-        response_parts = [
-            f"Moved mouse to ({actual_x}, {actual_y}) and captured {screenshot.size[0]}x{screenshot.size[1]} pixel rectangle with visual indicator",
+        return [
+            description,
             image_obj
         ]
-        
-        return response_parts
-        
+
     except Exception as e:
         error_msg = f"Error in mouse move screenshot: {str(e)}"
         if ctx is not None:
